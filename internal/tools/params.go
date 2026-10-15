@@ -13,6 +13,7 @@ const (
 	defaultListDays   = 30
 	defaultListLimit  = 100
 	defaultGroupLimit = 50
+	defaultFlowMonths = 12
 	// maxLimit держит ответ небольшим: тысяча операций — это десятки тысяч токенов.
 	maxLimit = 1000
 
@@ -31,6 +32,11 @@ func lastDays(n int) startFunc {
 // monthStart — 1-е число месяца, в котором конец периода.
 func monthStart(end time.Time) time.Time {
 	return time.Date(end.Year(), end.Month(), 1, 0, 0, 0, 0, end.Location())
+}
+
+// lastMonths — n календарных месяцев, считая месяц конца.
+func lastMonths(n int) startFunc {
+	return func(end time.Time) time.Time { return monthStart(end).AddDate(0, 1-n, 0) }
 }
 
 // parsePeriod проверяет prefix+"from" и prefix+"to". С start пустой to — сегодня, а пустой
@@ -76,10 +82,29 @@ func parseKind(value string) (report.Kind, error) {
 	}
 }
 
+// parseFlowKind — тип для сводок: расход по умолчанию или доход. Переводы в сводки не входят.
+func parseFlowKind(value string) (report.Kind, error) {
+	switch kind := cmp.Or(report.Kind(value), report.Expense); kind {
+	case report.Expense, report.Income:
+		return kind, nil
+	default:
+		return "", fmt.Errorf("type: ожидается expense или income, получено %q", value)
+	}
+}
+
 func parseGroupBy(value string) (report.GroupBy, error) {
 	by := report.GroupBy(cmp.Or(value, string(report.ByCategory)))
 	if !by.Valid() {
 		return "", fmt.Errorf("group_by: ожидается category, subcategory, merchant, day, week или month, получено %q", value)
+	}
+	return by, nil
+}
+
+// parsePeriodBy проверяет разрез по календарю в параметре name; пустое значение даёт fallback.
+func parsePeriodBy(name, value string, fallback report.GroupBy) (report.GroupBy, error) {
+	by := cmp.Or(report.GroupBy(value), fallback)
+	if by != "" && !by.IsPeriod() {
+		return "", fmt.Errorf("%s: ожидается day, week или month, получено %q", name, value)
 	}
 	return by, nil
 }

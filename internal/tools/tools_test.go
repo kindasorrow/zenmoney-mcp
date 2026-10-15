@@ -19,7 +19,7 @@ import (
 	"zenmoney-mcp/internal/zenmoney"
 )
 
-// В диффе расход в рублях, расход в долларах и перевод между своими счетами.
+// В диффе расход в рублях, расход в долларах, перевод между своими счетами и зарплата.
 const testDiff = `{
 	"serverTimestamp": 100,
 	"instrument": [{"id": 1, "shortTitle": "USD"}, {"id": 2, "shortTitle": "RUB"}],
@@ -28,8 +28,10 @@ const testDiff = `{
 		{"id": "savings", "title": "Накопления", "type": "deposit", "instrument": 2, "balance": 100000, "archive": false},
 		{"id": "usd", "title": "Долларовая", "type": "ccard", "instrument": 1, "balance": 50, "archive": false}
 	],
-	"tag": [{"id": "food", "title": "Еда"}, {"id": "cafe", "title": "Кафе", "parent": "food"}],
+	"tag": [{"id": "food", "title": "Еда"}, {"id": "cafe", "title": "Кафе", "parent": "food"}, {"id": "salary", "title": "Зарплата"}],
 	"transaction": [
+		{"id": "t4", "date": "2026-10-05", "income": 50000, "outcome": 0, "incomeAccount": "card", "outcomeAccount": "card",
+		 "incomeInstrument": 2, "outcomeInstrument": 2, "tag": ["salary"]},
 		{"id": "t1", "date": "2026-10-01", "income": 0, "outcome": 300, "incomeAccount": "card", "outcomeAccount": "card",
 		 "incomeInstrument": 2, "outcomeInstrument": 2, "tag": ["cafe"], "payee": "Кофейня"},
 		{"id": "t2", "date": "2026-10-02", "income": 10000, "outcome": 10000, "incomeAccount": "savings", "outcomeAccount": "card",
@@ -120,6 +122,7 @@ func TestTools_AllReadOnly(t *testing.T) {
 	want := map[string]bool{
 		"sync": true, "list_accounts": true, "list_transactions": true,
 		"spending_summary": true, "compare_periods": true, "recurring_payments": true,
+		"cash_flow": true, "query": true,
 	}
 	if len(res.Tools) != len(want) {
 		t.Errorf("тулов %d, want %d", len(res.Tools), len(want))
@@ -152,6 +155,68 @@ func TestSpendingSummary_SkipsTransfersAndSplitsCurrencies(t *testing.T) {
 	}
 }
 
+func TestSpendingSummary_Income(t *testing.T) {
+	cs := connect(t, time.Hour)
+
+	var got spendingSummary
+	callJSON(t, cs, "spending_summary", map[string]any{"date_from": "2026-10-01", "date_to": "2026-10-31", "type": "income"}, &got)
+
+	if got.Type != report.Income || len(got.Currencies) != 1 {
+		t.Fatalf("spending_summary = %+v", got)
+	}
+	if rub := got.Currencies[0]; rub.Total != 50000 || rub.Groups[0].Key != "Зарплата" {
+		t.Errorf("доходы RUB = %+v", rub)
+	}
+}
+
+func TestSpendingSummary_SplitBy(t *testing.T) {
+	cs := connect(t, time.Hour)
+
+	var got spendingSummary
+	callJSON(t, cs, "spending_summary", map[string]any{"date_from": "2026-10-01", "date_to": "2026-10-31", "split_by": "day"}, &got)
+
+	food := got.Currencies[0].Groups[0]
+	if food.Key != "Еда" || len(food.Periods) != 1 || food.Periods["2026-10-01"] != 300 {
+		t.Errorf("Еда по дням = %+v", food)
+	}
+}
+
+// Перевод на накопительный не трата и не доход: иначе savings_rate занижался бы.
+func TestCashFlow_SkipsTransfers(t *testing.T) {
+	cs := connect(t, time.Hour)
+
+	var got cashFlow
+	callJSON(t, cs, "cash_flow", map[string]any{"date_from": "2026-10-01", "date_to": "2026-10-31"}, &got)
+
+	if got.GroupBy != report.ByMonth || len(got.Currencies) != 2 {
+		t.Fatalf("cash_flow = %+v", got)
+	}
+	rub := got.Currencies[0]
+	if rub.Income != 50000 || rub.Expense != 300 || rub.Net != 49700 || rub.SavingsRate == nil || *rub.SavingsRate != 99.4 {
+		t.Errorf("RUB = %+v", rub)
+	}
+	if len(rub.Periods) != 1 || rub.Periods[0].Key != "2026-10" {
+		t.Errorf("периоды RUB = %+v", rub.Periods)
+	}
+	if usd := got.Currencies[1]; usd.Currency != "USD" || usd.Expense != 15 || usd.SavingsRate != nil {
+		t.Errorf("USD = %+v", usd)
+	}
+}
+
+func TestQuery_Aggregate(t *testing.T) {
+	cs := connect(t, time.Hour)
+
+	var got store.QueryResult
+	callJSON(t, cs, "query", map[string]any{
+		"sql": "SELECT currency, SUM(amount) AS total FROM operations WHERE kind = 'expense' GROUP BY currency ORDER BY currency",
+	}, &got)
+
+	want := `{"columns":["currency","total"],"rows":[["RUB",300],["USD",15]]}`
+	if body, _ := json.Marshal(got); string(body) != want {
+		t.Errorf("query = %s, want %s", body, want)
+	}
+}
+
 func TestListTransactions_Transfer(t *testing.T) {
 	cs := connect(t, time.Hour)
 
@@ -178,6 +243,10 @@ func TestTools_RejectInvalidArguments(t *testing.T) {
 		want string
 	}{
 		{"spending_summary", map[string]any{"group_by": "year"}, "group_by"},
+		{"spending_summary", map[string]any{"type": "transfer"}, "type"},
+		{"spending_summary", map[string]any{"group_by": "month", "split_by": "day"}, "split_by"},
+		{"cash_flow", map[string]any{"group_by": "category"}, "group_by"},
+		{"query", map[string]any{"sql": "DELETE FROM transactions"}, "SELECT"},
 		{"list_transactions", map[string]any{"date_from": "01.10.2026"}, "date_from"},
 		{"list_transactions", map[string]any{"limit": 5000}, "limit"},
 		{"compare_periods", map[string]any{"a_from": "2026-10-01", "a_to": "2026-09-01", "b_from": "2026-10-01", "b_to": "2026-10-31"}, "a_from"},

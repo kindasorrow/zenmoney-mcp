@@ -21,6 +21,8 @@ func TestParsePeriod(t *testing.T) {
 			store.Period{From: "2026-09-01", To: "2026-09-30"}, ""},
 		{"30 дней включая конец", "date_", "", "2026-10-15", lastDays(30),
 			store.Period{From: "2026-09-16", To: "2026-10-15"}, ""},
+		{"12 месяцев включая месяц конца", "date_", "", "2026-10-15", lastMonths(12),
+			store.Period{From: "2025-11-01", To: "2026-10-15"}, ""},
 		{"явные границы", "date_", "2026-01-01", "2026-01-31", monthStart,
 			store.Period{From: "2026-01-01", To: "2026-01-31"}, ""},
 		{"начало позже конца", "date_", "2026-10-02", "2026-10-01", monthStart, store.Period{}, "date_from"},

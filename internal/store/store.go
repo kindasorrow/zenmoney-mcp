@@ -3,6 +3,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"maps"
 	"net/url"
@@ -31,6 +33,8 @@ const batchSize = 500
 // Store — локальный кэш: файл можно удалить, следующий синк скачает всё заново.
 type Store struct {
 	db *gorm.DB
+	// ro — отдельное соединение только на чтение для тула query.
+	ro *sql.DB
 }
 
 // Open открывает базу, при необходимости создаёт файл и схему.
@@ -39,16 +43,13 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	// Драйвер разбирает DSN как URL: без экранирования «#» или «%» в пути открыли бы другой файл.
-	dsn := "file:" + (&url.URL{Path: path}).EscapedPath() + "?" + strings.Join([]string{
+	// glebarez/sqlite — диалект GORM на движке modernc.org/sqlite: чистый Go, без cgo.
+	db, err := gorm.Open(sqlite.Open(dsn(path,
 		"_pragma=busy_timeout(5000)", // ждать запись второго контейнера на том же файле
 		"_pragma=journal_mode(WAL)",  // чтение не блокируется чужой записью
 		"_pragma=temp_store(memory)", // корневая ФС контейнера read-only
 		"_txlock=immediate",          // Apply читает метку и пишет без гонки с чужим коммитом
-	}, "&")
-
-	// glebarez/sqlite — диалект GORM на движке modernc.org/sqlite: чистый Go, без cgo.
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+	)), &gorm.Config{
 		// stdout занят MCP, а логгер GORM пишет туда по умолчанию; ошибки и так возвращаются наверх.
 		Logger:                                   logger.Discard,
 		DisableForeignKeyConstraintWhenMigrating: true,
@@ -64,24 +65,50 @@ func Open(path string) (*Store, error) {
 	// Одно соединение: писатель в SQLite один, а с пулом параллельные тулы ловили бы SQLITE_BUSY.
 	sqlDB.SetMaxOpenConns(1)
 
-	if err := migrate(db); err != nil {
+	if err = migrate(db); err != nil {
 		_ = sqlDB.Close()
 		return nil, err
 	}
 
-	return &Store{db: db}, nil
+	ro, err := openReadOnly(path)
+	if err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
+
+	return &Store{db: db, ro: ro}, nil
+}
+
+// openReadOnly открывает файл в mode=ro: SQLite отказывает в любой записи в базу,
+// что бы ни прислали в query. Временные таблицы при этом доступны, они в памяти.
+func openReadOnly(path string) (*sql.DB, error) {
+	ro, err := sql.Open(sqlite.DriverName, dsn(path, "mode=ro", "_pragma=busy_timeout(5000)", "_pragma=temp_store(memory)"))
+	if err != nil {
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	if err := ro.Ping(); err != nil {
+		_ = ro.Close()
+		return nil, fmt.Errorf("store: open %s read-only: %w", path, err)
+	}
+	return ro, nil
+}
+
+// dsn собирает URI файла. Драйвер разбирает его как URL: без экранирования «#» или «%» в пути открыли бы другой файл.
+func dsn(path string, params ...string) string {
+	return "file:" + (&url.URL{Path: path}).EscapedPath() + "?" + strings.Join(params, "&")
 }
 
 // migrate создаёт схему. Повтор — для двух контейнеров на пустом volume: второй падает
 // на CREATE TABLE, а при повторе таблицы уже есть.
 func migrate(db *gorm.DB) error {
-	if db.AutoMigrate(models...) == nil {
-		return nil
+	err := db.AutoMigrate(models...)
+	if err != nil {
+		err = db.AutoMigrate(models...)
 	}
-	if err := db.AutoMigrate(models...); err != nil {
+	if err != nil {
 		return fmt.Errorf("store: migrate schema: %w", err)
 	}
-	return nil
+	return createOperationsView(db)
 }
 
 // createPrivateFile создаёт файл базы с правами 0600 до драйвера, который взял бы umask (обычно 0644):
@@ -103,9 +130,9 @@ func createPrivateFile(path string) error {
 func (s *Store) Close() error {
 	sqlDB, err := s.db.DB()
 	if err != nil {
-		return fmt.Errorf("store: get connection pool: %w", err)
+		return errors.Join(s.ro.Close(), fmt.Errorf("store: get connection pool: %w", err))
 	}
-	return sqlDB.Close()
+	return errors.Join(s.ro.Close(), sqlDB.Close())
 }
 
 // ServerTimestamp — метка последнего применённого диффа; ноль до первого синка.

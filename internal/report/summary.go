@@ -29,7 +29,8 @@ func (g GroupBy) Valid() bool {
 	return false
 }
 
-func (g GroupBy) isPeriod() bool {
+// IsPeriod — разрез по календарю: день, неделя или месяц.
+func (g GroupBy) IsPeriod() bool {
 	return g == ByDay || g == ByWeek || g == ByMonth
 }
 
@@ -66,11 +67,13 @@ func reformatDate(date string, format func(time.Time) string) string {
 }
 
 // Group — строка сводки. Share — доля от итога валюты в процентах.
+// Periods — сумма группы по периодам SummaryOptions.Split; периодов без операций в ней нет.
 type Group struct {
-	Key   string  `json:"key"`
-	Sum   float64 `json:"sum"`
-	Count int     `json:"count"`
-	Share float64 `json:"share"`
+	Key     string             `json:"key"`
+	Sum     float64            `json:"sum"`
+	Count   int                `json:"count"`
+	Share   float64            `json:"share"`
+	Periods map[string]float64 `json:"periods,omitempty"`
 }
 
 // CurrencySummary — сводка в одной валюте. Omitted — групп, не вошедших из-за limit; Total их учитывает.
@@ -82,19 +85,27 @@ type CurrencySummary struct {
 	Omitted  int     `json:"omitted,omitempty"`
 }
 
-// Summarize сводит расходы по валютам и группам, не смешивая валюты; доходы и переводы пропускаются.
-// limit режет только категории и мерчантов: у периодов обрезка по сумме убрала бы дни из середины диапазона.
-func Summarize(txs []Transaction, by GroupBy, limit int) []CurrencySummary {
+// SummaryOptions — параметры Summarize. Пустой Kind — расходы; Split пуст, если разбивка по периодам не нужна.
+type SummaryOptions struct {
+	Kind  Kind
+	By    GroupBy
+	Split GroupBy
+	Limit int
+}
+
+// Summarize сводит расходы или доходы по валютам и группам, не смешивая валюты; переводы пропускаются.
+// Limit режет только категории и мерчантов: у периодов обрезка по сумме убрала бы дни из середины диапазона.
+func Summarize(txs []Transaction, opts SummaryOptions) []CurrencySummary {
 	out := []CurrencySummary{}
-	for currency, buckets := range expenseBuckets(txs, by.key) {
-		out = append(out, summarizeCurrency(currency, buckets, by, limit))
+	for currency, buckets := range groupBuckets(txs, cmp.Or(opts.Kind, Expense), opts.By, opts.Split) {
+		out = append(out, summarizeCurrency(currency, buckets, opts))
 	}
 	slices.SortFunc(out, func(a, b CurrencySummary) int { return currencyOrder(a.Currency, b.Currency) })
 
 	return out
 }
 
-func summarizeCurrency(currency string, buckets map[string]*bucket, by GroupBy, limit int) CurrencySummary {
+func summarizeCurrency(currency string, buckets map[string]*bucket, opts SummaryOptions) CurrencySummary {
 	s := CurrencySummary{Currency: currency}
 
 	var total float64
@@ -105,10 +116,13 @@ func summarizeCurrency(currency string, buckets map[string]*bucket, by GroupBy, 
 	s.Total = round2(total)
 
 	for key, b := range buckets {
-		s.Groups = append(s.Groups, Group{Key: key, Sum: round2(b.sum), Count: b.count, Share: share(b.sum, total)})
+		for period, sum := range b.periods {
+			b.periods[period] = round2(sum)
+		}
+		s.Groups = append(s.Groups, Group{Key: key, Sum: round2(b.sum), Count: b.count, Share: share(b.sum, total), Periods: b.periods})
 	}
 
-	if by.isPeriod() {
+	if opts.By.IsPeriod() {
 		slices.SortFunc(s.Groups, func(a, b Group) int { return strings.Compare(a.Key, b.Key) })
 		return s
 	}
@@ -116,9 +130,9 @@ func summarizeCurrency(currency string, buckets map[string]*bucket, by GroupBy, 
 	slices.SortFunc(s.Groups, func(a, b Group) int {
 		return cmp.Or(cmp.Compare(b.Sum, a.Sum), strings.Compare(a.Key, b.Key))
 	})
-	if limit > 0 && len(s.Groups) > limit {
-		s.Omitted = len(s.Groups) - limit
-		s.Groups = s.Groups[:limit]
+	if opts.Limit > 0 && len(s.Groups) > opts.Limit {
+		s.Omitted = len(s.Groups) - opts.Limit
+		s.Groups = s.Groups[:opts.Limit]
 	}
 
 	return s
@@ -143,10 +157,10 @@ type CurrencyComparison struct {
 	Rows     []CompareRow `json:"rows"`
 }
 
-// Compare сравнивает расходы двух периодов по категориям верхнего уровня; строки идут по убыванию |Diff|.
-func Compare(a, b []Transaction) []CurrencyComparison {
-	bucketsA := expenseBuckets(a, ByCategory.key)
-	bucketsB := expenseBuckets(b, ByCategory.key)
+// Compare сравнивает расходы или доходы двух периодов по категориям верхнего уровня; строки идут по убыванию |Diff|.
+func Compare(a, b []Transaction, kind Kind) []CurrencyComparison {
+	bucketsA := groupBuckets(a, kind, ByCategory, "")
+	bucketsB := groupBuckets(b, kind, ByCategory, "")
 
 	out := []CurrencyComparison{}
 	for _, currency := range unionKeys(bucketsA, bucketsB) {
@@ -187,8 +201,9 @@ func compareCurrency(currency string, a, b map[string]*bucket) CurrencyCompariso
 }
 
 type bucket struct {
-	sum   float64
-	count int
+	sum     float64
+	count   int
+	periods map[string]float64
 }
 
 // total безопасен для nil: категории может не быть в одном из периодов.
@@ -199,32 +214,47 @@ func (b *bucket) total() float64 {
 	return b.sum
 }
 
-// expenseBuckets раскладывает расходы по валюте, а внутри неё по ключу группы.
-func expenseBuckets(txs []Transaction, key func(Transaction) string) map[string]map[string]*bucket {
+// groupBuckets раскладывает операции типа kind по валюте, а внутри неё по группе by.
+// С непустым split сумма группы копится ещё и по периодам.
+func groupBuckets(txs []Transaction, kind Kind, by, split GroupBy) map[string]map[string]*bucket {
 	byCurrency := map[string]map[string]*bucket{}
 
 	for _, t := range txs {
-		if t.Kind() != Expense {
+		if t.Kind() != kind {
 			continue
 		}
 
-		groups := byCurrency[t.OutcomeCurrency]
-		if groups == nil {
-			groups = map[string]*bucket{}
-			byCurrency[t.OutcomeCurrency] = groups
-		}
-
-		k := key(t)
-		b := groups[k]
-		if b == nil {
-			b = &bucket{}
-			groups[k] = b
-		}
-		b.sum += t.Outcome
+		amount, currency := t.Amount()
+		b := cell(byCurrency, currency, by.key(t))
+		b.sum += amount
 		b.count++
+
+		if split != "" {
+			if b.periods == nil {
+				b.periods = map[string]float64{}
+			}
+			b.periods[split.key(t)] += amount
+		}
 	}
 
 	return byCurrency
+}
+
+// cell возвращает m[outer][inner], создавая недостающие уровни.
+func cell[V any](m map[string]map[string]*V, outer, inner string) *V {
+	inners := m[outer]
+	if inners == nil {
+		inners = map[string]*V{}
+		m[outer] = inners
+	}
+
+	v := inners[inner]
+	if v == nil {
+		v = new(V)
+		inners[inner] = v
+	}
+
+	return v
 }
 
 // unionKeys — отсортированное объединение ключей двух карт.

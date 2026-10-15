@@ -24,6 +24,8 @@ linters:
       exclude-functions:
         - (io.Closer).Close
         - (*os.File).Close
+        - (*database/sql.Conn).Close
+        - (*database/sql.Rows).Close
         - (*zenmoney-mcp/internal/store.Store).Close
     govet:
       enable:

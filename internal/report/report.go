@@ -120,7 +120,7 @@ func (f Filter) match(t Transaction) bool {
 	return true
 }
 
-// containsFold регистронезависим в Go, а не в SQL: LOWER в SQLite без ICU не понижает кириллицу.
+// containsFold складывает регистр по Unicode: «еда» находит «Еда».
 func containsFold(s, substr string) bool {
 	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
 }

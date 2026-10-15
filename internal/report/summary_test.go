@@ -17,7 +17,7 @@ func TestSummarize_ByCategory(t *testing.T) {
 		{Date: "2026-10-06", Income: 100000, IncomeCurrency: "RUB", Category: "Зарплата"},
 	}
 
-	got := Summarize(txs, ByCategory, 0)
+	got := Summarize(txs, SummaryOptions{By: ByCategory})
 	want := []CurrencySummary{
 		{Currency: "RUB", Total: 2000, Count: 3, Groups: []Group{
 			{Key: "Без категории", Sum: 1000, Count: 1, Share: 50},
@@ -39,7 +39,7 @@ func TestSummarize_BySubcategory(t *testing.T) {
 		expense("2026-10-02", 700, "RUB", "Еда", "", ""),
 	}
 
-	got := Summarize(txs, BySubcategory, 0)[0].Groups
+	got := Summarize(txs, SummaryOptions{By: BySubcategory})[0].Groups
 	want := []Group{
 		{Key: "Еда", Sum: 700, Count: 1, Share: 70},
 		{Key: "Еда / Кафе", Sum: 300, Count: 1, Share: 30},
@@ -58,7 +58,7 @@ func TestSummarize_LimitKeepsLargest(t *testing.T) {
 		expense("2026-10-03", 600, "RUB", "", "", "Пятёрочка"),
 	}
 
-	got := Summarize(txs, ByMerchant, 2)[0]
+	got := Summarize(txs, SummaryOptions{By: ByMerchant, Limit: 2})[0]
 
 	if got.Total != 1000 || got.Omitted != 1 || len(got.Groups) != 2 {
 		t.Fatalf("Summarize() = %+v", got)
@@ -77,7 +77,7 @@ func TestSummarize_ByWeek(t *testing.T) {
 		expense("2026-10-05", 400, "RUB", "", "", ""),
 	}
 
-	got := Summarize(txs, ByWeek, 1)[0].Groups
+	got := Summarize(txs, SummaryOptions{By: ByWeek, Limit: 1})[0].Groups
 	want := []Group{
 		{Key: "2026-10-05", Sum: 400, Count: 1, Share: 53.3},
 		{Key: "2026-10-12", Sum: 300, Count: 2, Share: 40},
@@ -90,8 +90,49 @@ func TestSummarize_ByWeek(t *testing.T) {
 }
 
 func TestSummarize_Empty(t *testing.T) {
-	if got := Summarize(nil, ByMonth, 0); got == nil || len(got) != 0 {
+	if got := Summarize(nil, SummaryOptions{By: ByMonth}); got == nil || len(got) != 0 {
 		t.Errorf("Summarize(nil) = %#v, want пустой срез", got)
+	}
+}
+
+// Доходы считаются по стороне зачисления, расходы и переводы в сводку доходов не входят.
+func TestSummarize_Income(t *testing.T) {
+	txs := []Transaction{
+		{Date: "2026-10-05", Income: 100000, IncomeCurrency: "RUB", Category: "Зарплата"},
+		{Date: "2026-10-20", Income: 20000, IncomeCurrency: "RUB", Category: "Зарплата"},
+		{Date: "2026-10-21", Income: 50, IncomeCurrency: "USD", Category: "Кэшбэк"},
+		{Date: "2026-10-06", Income: 5000, IncomeCurrency: "RUB", Outcome: 5000, OutcomeCurrency: "RUB"},
+		expense("2026-10-07", 300, "RUB", "Еда", "", ""),
+	}
+
+	got := Summarize(txs, SummaryOptions{Kind: Income, By: ByCategory})
+	want := []CurrencySummary{
+		{Currency: "RUB", Total: 120000, Count: 2, Groups: []Group{{Key: "Зарплата", Sum: 120000, Count: 2, Share: 100}}},
+		{Currency: "USD", Total: 50, Count: 1, Groups: []Group{{Key: "Кэшбэк", Sum: 50, Count: 1, Share: 100}}},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Summarize() =\n%+v\nwant\n%+v", got, want)
+	}
+}
+
+// Split раскладывает сумму каждой категории по месяцам; месяцев без трат в разбивке нет.
+func TestSummarize_SplitByMonth(t *testing.T) {
+	txs := []Transaction{
+		expense("2026-09-01", 100.1, "RUB", "Еда", "", ""),
+		expense("2026-09-15", 200.2, "RUB", "Кафе", "Еда", ""),
+		expense("2026-10-01", 400, "RUB", "Еда", "", ""),
+		expense("2026-10-02", 50, "RUB", "Такси", "", ""),
+	}
+
+	got := Summarize(txs, SummaryOptions{By: ByCategory, Split: ByMonth})[0].Groups
+	want := []Group{
+		{Key: "Еда", Sum: 700.3, Count: 3, Share: 93.3, Periods: map[string]float64{"2026-09": 300.3, "2026-10": 400}},
+		{Key: "Такси", Sum: 50, Count: 1, Share: 6.7, Periods: map[string]float64{"2026-10": 50}},
+	}
+
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("Groups = %+v, want %+v", got, want)
 	}
 }
 
@@ -108,7 +149,7 @@ func TestCompare(t *testing.T) {
 		expense("2026-10-04", 10, "USD", "Подписки", "", ""),
 	}
 
-	got := Compare(a, b)
+	got := Compare(a, b, Expense)
 	if len(got) != 2 || got[0].Currency != "RUB" || got[1].Currency != "USD" {
 		t.Fatalf("Compare() валюты = %+v", got)
 	}
