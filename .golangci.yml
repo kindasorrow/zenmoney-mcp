@@ -1,0 +1,42 @@
+# Узкий набор без споров о вкусах: стилистический линтер приучает писать nolint, а не читать замечания.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    # Незакрытое тело ответа ZenMoney течёт соединениями.
+    - bodyclose
+    # Ошибки сравниваются через errors.Is: ErrUnauthorized приходит обёрнутой.
+    - errorlint
+    - gocritic
+    - misspell
+    - nakedret
+    - unconvert
+    - wastedassign
+
+  settings:
+    errcheck:
+      # Отложенному Close ошибку некуда отдать. Типы перечислены явно:
+      # правило для io.Closer срабатывает только на вызов через интерфейс.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (*zenmoney-mcp/internal/store.Store).Close
+    govet:
+      enable:
+        - shadow
+
+  exclusions:
+    rules:
+      # В тестах длинные функции и повторы — это перечисление случаев.
+      - path: _test\.go
+        linters:
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

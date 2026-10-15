@@ -1,0 +1,22 @@
+services:
+  zenmoney-mcp:
+    build:
+      context: .
+      dockerfile: .docker/Dockerfile
+    image: zenmoney-mcp:local
+    env_file: .env
+    environment:
+      # Даты операций в ZenMoney — по местному календарю, а без TZ «сегодня» в контейнере считается по UTC.
+      TZ: ${TZ:-Europe/Moscow}
+    # MCP идёт по stdin/stdout: Claude Code запускает контейнер на сессию через compose run --rm -T, портов нет.
+    stdin_open: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - zenmoney-data:/data
+
+volumes:
+  zenmoney-data:
